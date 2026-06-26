@@ -31,6 +31,7 @@ import { WorkspaceManager } from "./workspace.js";
 import { RetryQueue, type RetryEntry } from "./retry.js";
 import { runAttempt } from "./runner.js";
 import { reconcile } from "./reconciler.js";
+import { TaskStreamHub } from "./taskstream.js";
 import { Logger } from "./logger.js";
 
 export type AbortReason = "stall" | "terminal" | "neither" | "shutdown";
@@ -67,6 +68,8 @@ export class Orchestrator {
   readonly tracker: Tracker;
   readonly registry: AgentRegistry;
   readonly log: Logger;
+  /** Per-task event streams for `symphony watch` / the board's live log pane. */
+  readonly streams = new TaskStreamHub();
 
   private _config: Config;
   private _promptTemplate: string;
@@ -324,6 +327,10 @@ export class Orchestrator {
       continuation: Boolean(opts.sessionId),
       state: issue.state,
     });
+    this.streams.publish(issue, {
+      kind: "dispatched",
+      message: `dispatched · driver=${driverName} · attempt=${entry.attempt} · state=${issue.state}`,
+    });
 
     entry.done = (async () => {
       try {
@@ -374,6 +381,10 @@ export class Orchestrator {
     if (event.type === "turn_failed") logc.warn("agent turn failed", { error: event.error });
     else if (event.type === "tool_call") logc.debug("tool call", { name: event.name });
     else if (event.type === "session_started") logc.info("session started", { pid: event.pid });
+    // Fan out every event to the per-task stream (terminal watch / board pane).
+    // `kind` + `data` are the stable contract; `message` is cosmetic only.
+    const { type: _type, ts: _ts, ...data } = event;
+    this.streams.publish(entry.issue, { kind: event.type, ts: event.ts, data, message: streamMessage(event) });
   }
 
   private async handleOutcome(entry: RunningEntry, result: RunResult): Promise<void> {
@@ -399,8 +410,13 @@ export class Orchestrator {
       runtime_s: result.runtimeSeconds.toFixed(1),
       error: result.error,
     });
+    this.streams.publish(issue, {
+      kind: "attempt_finished",
+      message: `attempt finished · ${outcome}${reason ? ` (${reason})` : ""} · ${result.runtimeSeconds.toFixed(1)}s`,
+    });
 
     if (reason === "shutdown") {
+      this.streams.end(issue, "daemon shutdown");
       this.releaseClaim(issue.id);
       return;
     }
@@ -454,11 +470,13 @@ export class Orchestrator {
       return;
     }
     this.claimed.add(issue.id);
+    this.streams.publish(issue, { kind: "continuation_scheduled", message: "continuation scheduled (resuming session)" });
     this.retryQueue.scheduleContinuation(issue, entry.sessionId, (e) => this.onRetryFire(e));
   }
 
   private scheduleFailureRetry(entry: RunningEntry, error: string): void {
     this.claimed.add(entry.issue.id); // retrying => claimed
+    this.streams.publish(entry.issue, { kind: "retry_scheduled", message: `retry scheduled · ${error}` });
     this.retryQueue.scheduleFailure(entry.issue, entry.attempt, error, (e) => this.onRetryFire(e));
   }
 
@@ -476,6 +494,8 @@ export class Orchestrator {
     }
     this.releaseClaim(issue.id);
     logc.info("issue finalized", { workspace_cleaned: cleanup });
+    this.streams.publish(issue, { kind: "finalized", message: `finalized · workspace ${cleanup ? "cleaned" : "kept"}` });
+    this.streams.end(issue);
   }
 
   private releaseClaim(issueId: string): void {
@@ -549,6 +569,7 @@ export class Orchestrator {
     entry.abortReason = reason;
     entry.abort.abort();
     this.log.child({ issue_identifier: entry.issue.identifier }).info("terminating worker", { reason });
+    this.streams.publish(entry.issue, { kind: "terminating", message: `terminating · ${reason}` });
   }
 
   updateRunningState(issueId: string, state: string): void {
@@ -628,6 +649,40 @@ export class Orchestrator {
   /** Force an immediate poll + reconcile cycle (HTTP POST /api/v1/refresh). */
   async refreshNow(): Promise<void> {
     await this.pollTick();
+  }
+}
+
+/** A short, human-readable line for a runtime event, shown by `symphony watch`. */
+function streamMessage(e: RuntimeEvent): string {
+  switch (e.type) {
+    case "session_started":
+      return e.pid ? `session started (pid ${e.pid})` : "session started";
+    case "turn_started":
+      return "turn started";
+    case "turn_completed":
+      return e.usage?.totalTokens != null ? `turn completed · ${e.usage.totalTokens} tokens` : "turn completed";
+    case "turn_failed":
+      return `turn failed: ${e.error}`;
+    case "turn_cancelled":
+      return "turn cancelled";
+    case "approval_auto_approved":
+      return `auto-approved: ${e.what}`;
+    case "unsupported_tool_call":
+      return `unsupported tool: ${e.name}`;
+    case "tool_call":
+      return `tool · ${e.name}`;
+    case "log":
+      return e.message;
+    case "usage":
+      return e.usage?.totalTokens != null ? `usage · ${e.usage.totalTokens} tokens` : "usage";
+    default: {
+      // Exhaustiveness guard: adding a RuntimeEvent variant without a case above
+      // is a COMPILE error here, not a silent fallthrough. We still degrade
+      // gracefully at runtime (message is cosmetic) to the raw type string.
+      const _exhaustive: never = e;
+      void _exhaustive;
+      return (e as { type: string }).type;
+    }
   }
 }
 

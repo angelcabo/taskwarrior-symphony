@@ -57,7 +57,7 @@ The spec's six layers are preserved exactly; only the Integration Layer changed.
 | **Coordination** | [`src/orchestrator.ts`](./src/orchestrator.ts) + [`reconciler.ts`](./src/reconciler.ts) + [`retry.ts`](./src/retry.ts) — in-memory polling loop, eligibility, concurrency, backoff |
 | **Execution** | [`workspace.ts`](./src/workspace.ts), [`hooks.ts`](./src/hooks.ts), [`prompt.ts`](./src/prompt.ts), [`runner.ts`](./src/runner.ts) |
 | **Integration** | [`taskwarrior.ts`](./src/taskwarrior.ts) — **replaces the Linear GraphQL adapter** |
-| **Observability** | [`logger.ts`](./src/logger.ts) (structured logs) + [`http.ts`](./src/http.ts) (`/api/v1/*`) |
+| **Observability** | [`logger.ts`](./src/logger.ts) (structured logs) + [`http.ts`](./src/http.ts) (`/api/v1/*`, incl. live per-task SSE) + `symphony watch <id>` |
 
 **Coordination Layer choice:** the spec says no database is required — "recovery
 is tracker- and filesystem-driven after restart." Taskwarrior *is* the durable
@@ -98,9 +98,11 @@ export TASKRC=/tmp/symphony-demo.taskrc TASKDATA=/tmp/symphony-demo.task
 SYMPHONY_LOG_PRETTY=1 symphony start  # run the daemon — watch tasks flow
 
 # from another pane, inspect or poke the running daemon:
-symphony state                                   # GET  /api/v1/state
-symphony refresh                                 # POST /api/v1/refresh
-curl -s localhost:4517/api/v1/SYM-xxxxxxxx | jq  # per-issue detail
+symphony state                  # all tasks in flight (one-shot JSON)
+symphony state -f               # …or a live top-style overview (refreshes every 2s)
+symphony watch SYM-ab12cd34     # one task: state header + recent log, then exit (id, uuid, or prefix)
+symphony watch -f SYM-ab12cd34  # …or follow it live (tail -f); add -n N to cap the lines shown
+symphony refresh                # poll + reconcile now
 ```
 
 Point it at **real** work — your own repo, a real agent — by giving the clone hook a repo
@@ -185,8 +187,9 @@ src/
   retry.ts         Exponential-backoff + continuation retry queue
   reconciler.ts    Stall detection + tracker state refresh
   orchestrator.ts  Single-authority polling loop, eligibility, concurrency
-  http.ts          /api/v1/{state,<id>,refresh}
-  index.ts         CLI: start | validate | state | refresh
+  taskstream.ts    Per-task event pub/sub + replay buffer (powers `symphony watch`)
+  http.ts          /api/v1/{state,<id>,<id>/stream,refresh}
+  index.ts         CLI: start | validate | state | refresh | watch
 ```
 
 ## License
