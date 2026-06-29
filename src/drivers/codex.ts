@@ -23,14 +23,19 @@
  * `dangerously_bypass: true` removes the sandbox entirely for full autonomy.
  */
 
-import { spawn, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import type { RunResult, RuntimeEvent, TokenUsage } from "../domain.js";
 import {
   type AgentDriver,
   type AgentRunContext,
   type AvailabilityResult,
+  type LineProcess,
   AgentAbortError,
   splitCommand,
+  parseJsonLine,
+  resolveOnPath,
+  spawnLines,
+  SANDBOX_ATTACH_AUTORESPOND,
 } from "../agent.js";
 import type { Config } from "../config.js";
 
@@ -63,33 +68,36 @@ export class CodexDriver implements AgentDriver {
     if (cfg.skipGitRepoCheck) flags.push("--skip-git-repo-check");
     if (cfg.dangerouslyBypass) flags.push("--dangerously-bypass-approvals-and-sandbox");
 
+    // Prompt delivery: `-` reads from stdin (default). When `command` routes
+    // through a wrapper that does not forward stdin (e.g. a Docker sandbox),
+    // deliver the prompt as the positional PROMPT arg instead.
+    const tail = cfg.promptArg ? ctx.prompt : "-";
+
     if (ctx.sessionId) {
       // Continuation: resume inherits the session's cwd + sandbox.
-      return { bin, args: [...base, "exec", "resume", ...flags, ...cfg.extraArgs, ctx.sessionId, "-"] };
+      return { bin, args: [...base, "exec", "resume", ...flags, ...cfg.extraArgs, ctx.sessionId, tail] };
     }
 
     const first = [...flags];
     if (!cfg.dangerouslyBypass) first.push("--sandbox", cfg.sandbox);
     if (cfg.model) first.push("--model", cfg.model);
     first.push("-C", ctx.workspacePath);
-    return { bin, args: [...base, "exec", ...first, ...cfg.extraArgs, "-"] };
+    return { bin, args: [...base, "exec", ...first, ...cfg.extraArgs, tail] };
   }
 
   run(ctx: AgentRunContext): Promise<RunResult> {
     const started = Date.now();
     const { bin, args } = this.buildArgs(ctx.config, ctx);
     ctx.log.debug("launching codex exec", { bin, args: args.join(" "), workspace: ctx.workspacePath });
+    const wrapped = splitCommand(ctx.config.codex.command).args.length > 0;
 
     return new Promise<RunResult>((resolve, reject) => {
-      const child = spawn(bin, args, { cwd: ctx.workspacePath, env: ctx.env });
-
+      let proc: LineProcess;
       let sessionId = ctx.sessionId;
       let usage: TokenUsage | undefined;
       let finalResult: RunResult | null = null;
       let killed = false;
       let settled = false;
-      let stdoutBuf = "";
-      let stderrTail = "";
 
       const emit = (e: RuntimeEvent) => ctx.onEvent(e);
       const settle = (fn: () => void) => {
@@ -100,31 +108,25 @@ export class CodexDriver implements AgentDriver {
       };
       const onAbort = () => {
         killed = true;
-        child.kill("SIGTERM");
-        setTimeout(() => {
-          if (!child.killed) child.kill("SIGKILL");
-        }, 2000);
+        proc.kill("SIGTERM");
+        setTimeout(() => proc.kill("SIGKILL"), 2000);
       };
-      ctx.signal.addEventListener("abort", onAbort, { once: true });
 
       const isToolItem = (type: string | undefined): boolean =>
         type !== undefined && type !== "agent_message" && type !== "reasoning";
 
       const handleLine = (line: string) => {
-        const trimmed = line.trim();
-        if (trimmed === "") return;
-        let obj: Record<string, unknown>;
-        try {
-          obj = JSON.parse(trimmed);
-        } catch {
-          ctx.log.debug("codex: non-JSON line", { line: trimmed.slice(0, 200) });
+        const obj = parseJsonLine(line);
+        if (!obj) {
+          const t = line.trim();
+          if (t !== "") ctx.log.debug("codex: non-JSON line", { line: t.slice(0, 200) });
           return;
         }
         const item = obj["item"] as { type?: string; name?: string } | undefined;
         switch (obj["type"]) {
           case "thread.started":
             sessionId = (obj["thread_id"] as string) ?? sessionId;
-            emit({ type: "session_started", ts: Date.now(), sessionId: sessionId ?? "unknown", threadId: sessionId, pid: child.pid });
+            emit({ type: "session_started", ts: Date.now(), sessionId: sessionId ?? "unknown", threadId: sessionId, pid: proc.pid });
             break;
           case "turn.started":
             emit({ type: "turn_started", ts: Date.now() });
@@ -156,59 +158,56 @@ export class CodexDriver implements AgentDriver {
         }
       };
 
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdoutBuf += chunk.toString();
-        let nl: number;
-        while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
-          handleLine(stdoutBuf.slice(0, nl));
-          stdoutBuf = stdoutBuf.slice(nl + 1);
-        }
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
-      });
-
-      child.on("error", (err) => {
-        settle(() =>
-          reject(
-            new Error(
-              `failed to launch codex ("${bin}"): ${(err as NodeJS.ErrnoException).code === "ENOENT" ? "command not found" : err.message}`,
+      proc = spawnLines({
+        bin,
+        args,
+        cwd: ctx.workspacePath,
+        env: ctx.env,
+        usePty: wrapped,
+        autoRespond: wrapped ? SANDBOX_ATTACH_AUTORESPOND : undefined,
+        stdin: ctx.config.codex.promptArg ? null : ctx.prompt,
+        onLine: handleLine,
+        onError: (err) =>
+          settle(() =>
+            reject(
+              new Error(
+                `failed to launch codex ("${bin}"): ${(err as NodeJS.ErrnoException).code === "ENOENT" ? "command not found" : err.message}`,
+              ),
             ),
           ),
-        );
+        onExit: (code, tail) => {
+          const runtimeSeconds = (Date.now() - started) / 1000;
+          settle(() => {
+            if (killed) {
+              reject(new AgentAbortError());
+              return;
+            }
+            if (finalResult) resolve(finalResult);
+            else if (code === 0) resolve({ outcome: "Succeeded", sessionId, usage, runtimeSeconds });
+            else
+              resolve({
+                outcome: "Failed",
+                sessionId,
+                error: `codex exited with code ${code}${tail ? `: ${tail.trim()}` : ""}`,
+                runtimeSeconds,
+              });
+          });
+        },
       });
-
-      child.on("close", (code) => {
-        if (stdoutBuf.trim() !== "") handleLine(stdoutBuf);
-        const runtimeSeconds = (Date.now() - started) / 1000;
-        settle(() => {
-          if (killed) {
-            reject(new AgentAbortError());
-            return;
-          }
-          if (finalResult) resolve(finalResult);
-          else if (code === 0) resolve({ outcome: "Succeeded", sessionId, usage, runtimeSeconds });
-          else
-            resolve({
-              outcome: "Failed",
-              sessionId,
-              error: `codex exited with code ${code}${stderrTail ? `: ${stderrTail.trim()}` : ""}`,
-              runtimeSeconds,
-            });
-        });
-      });
-
-      try {
-        child.stdin?.write(ctx.prompt);
-        child.stdin?.end();
-      } catch {
-        /* child may have exited; close handler settles. */
-      }
+      ctx.signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
   async checkAvailable(config: Config): Promise<AvailabilityResult> {
-    const { bin } = splitCommand(config.codex.command);
+    const { bin, args } = splitCommand(config.codex.command);
+    if (args.length > 0) {
+      // Wrapped command (e.g. `sandbox codex --`): verify the wrapper is on PATH
+      // rather than running `<bin> --version`, which the wrapper may not support.
+      const resolved = resolveOnPath(bin);
+      return resolved
+        ? { ok: true, detail: `wrapper "${bin}" → ${resolved}` }
+        : { ok: false, detail: `wrapper "${bin}" not found on PATH` };
+    }
     return new Promise((resolve) => {
       execFile(bin, ["--version"], { timeout: 10_000 }, (err, stdout) => {
         if (err) resolve({ ok: false, detail: `"${bin} --version" failed: ${err.message}` });

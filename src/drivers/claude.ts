@@ -21,14 +21,19 @@
  * and rely on workspace isolation otherwise.
  */
 
-import { spawn, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import type { RunResult, RuntimeEvent, TokenUsage } from "../domain.js";
 import {
   type AgentDriver,
   type AgentRunContext,
   type AvailabilityResult,
+  type LineProcess,
   AgentAbortError,
   splitCommand,
+  parseJsonLine,
+  resolveOnPath,
+  spawnLines,
+  SANDBOX_ATTACH_AUTORESPOND,
 } from "../agent.js";
 import type { Config } from "../config.js";
 
@@ -58,13 +63,11 @@ export class ClaudeDriver implements AgentDriver {
   buildArgs(config: Config, ctx: AgentRunContext): { bin: string; args: string[] } {
     const cfg = config.claude;
     const { bin, args: baseArgs } = splitCommand(cfg.command);
-    const args = [
-      ...baseArgs,
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-    ];
+    const args = [...baseArgs, "-p"];
+    // When `command` routes through a wrapper that does not forward stdin
+    // (e.g. a Docker sandbox), deliver the prompt as a positional arg instead.
+    if (cfg.promptArg) args.push(ctx.prompt);
+    args.push("--output-format", "stream-json", "--verbose");
     if (cfg.permissionMode === "bypassPermissions") {
       args.push("--dangerously-skip-permissions");
     } else {
@@ -82,15 +85,13 @@ export class ClaudeDriver implements AgentDriver {
     const started = Date.now();
     const { bin, args } = this.buildArgs(ctx.config, ctx);
     ctx.log.debug("launching claude", { bin, args: args.join(" "), workspace: ctx.workspacePath });
+    const wrapped = splitCommand(ctx.config.claude.command).args.length > 0;
 
     return new Promise<RunResult>((resolve, reject) => {
-      const child = spawn(bin, args, { cwd: ctx.workspacePath, env: ctx.env });
-
+      let proc: LineProcess;
       let sessionId = ctx.sessionId;
       let finalResult: RunResult | null = null;
       let killed = false;
-      let stdoutBuf = "";
-      let stderrTail = "";
       let settled = false;
 
       const emit = (e: RuntimeEvent) => ctx.onEvent(e);
@@ -104,27 +105,21 @@ export class ClaudeDriver implements AgentDriver {
 
       const onAbort = () => {
         killed = true;
-        child.kill("SIGTERM");
-        setTimeout(() => {
-          if (!child.killed) child.kill("SIGKILL");
-        }, 2000);
+        proc.kill("SIGTERM");
+        setTimeout(() => proc.kill("SIGKILL"), 2000);
       };
-      ctx.signal.addEventListener("abort", onAbort, { once: true });
 
       const handleLine = (line: string) => {
-        const trimmed = line.trim();
-        if (trimmed === "") return;
-        let obj: Record<string, unknown>;
-        try {
-          obj = JSON.parse(trimmed);
-        } catch {
-          ctx.log.debug("claude: non-JSON line", { line: trimmed.slice(0, 200) });
+        const obj = parseJsonLine(line);
+        if (!obj) {
+          const t = line.trim();
+          if (t !== "") ctx.log.debug("claude: non-JSON line", { line: t.slice(0, 200) });
           return;
         }
         const type = obj["type"];
         if (type === "system" && obj["subtype"] === "init") {
           sessionId = (obj["session_id"] as string) ?? sessionId;
-          emit({ type: "session_started", ts: Date.now(), sessionId: sessionId ?? "unknown", pid: child.pid });
+          emit({ type: "session_started", ts: Date.now(), sessionId: sessionId ?? "unknown", pid: proc.pid });
         } else if (type === "assistant") {
           const message = obj["message"] as { content?: unknown[] } | undefined;
           const content = Array.isArray(message?.content) ? message!.content : [];
@@ -156,64 +151,60 @@ export class ClaudeDriver implements AgentDriver {
         }
       };
 
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdoutBuf += chunk.toString();
-        let nl: number;
-        while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
-          const line = stdoutBuf.slice(0, nl);
-          stdoutBuf = stdoutBuf.slice(nl + 1);
-          handleLine(line);
-        }
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
-      });
-
-      child.on("error", (err) => {
-        settle(() =>
-          reject(
-            new Error(
-              `failed to launch claude ("${bin}"): ${(err as NodeJS.ErrnoException).code === "ENOENT" ? "command not found" : err.message}`,
+      proc = spawnLines({
+        bin,
+        args,
+        cwd: ctx.workspacePath,
+        env: ctx.env,
+        usePty: wrapped,
+        autoRespond: wrapped ? SANDBOX_ATTACH_AUTORESPOND : undefined,
+        stdin: ctx.config.claude.promptArg ? null : ctx.prompt,
+        onLine: handleLine,
+        onError: (err) =>
+          settle(() =>
+            reject(
+              new Error(
+                `failed to launch claude ("${bin}"): ${(err as NodeJS.ErrnoException).code === "ENOENT" ? "command not found" : err.message}`,
+              ),
             ),
           ),
-        );
+        onExit: (code, tail) => {
+          const runtimeSeconds = (Date.now() - started) / 1000;
+          settle(() => {
+            if (killed) {
+              reject(new AgentAbortError());
+              return;
+            }
+            if (finalResult) {
+              resolve(finalResult);
+            } else if (code === 0) {
+              resolve({ outcome: "Succeeded", sessionId, runtimeSeconds });
+            } else {
+              resolve({
+                outcome: "Failed",
+                sessionId,
+                error: `claude exited with code ${code}${tail ? `: ${tail.trim()}` : ""}`,
+                runtimeSeconds,
+              });
+            }
+          });
+        },
       });
-
-      child.on("close", (code) => {
-        if (stdoutBuf.trim() !== "") handleLine(stdoutBuf);
-        const runtimeSeconds = (Date.now() - started) / 1000;
-        settle(() => {
-          if (killed) {
-            reject(new AgentAbortError());
-            return;
-          }
-          if (finalResult) {
-            resolve(finalResult);
-          } else if (code === 0) {
-            resolve({ outcome: "Succeeded", sessionId, runtimeSeconds });
-          } else {
-            resolve({
-              outcome: "Failed",
-              sessionId,
-              error: `claude exited with code ${code}${stderrTail ? `: ${stderrTail.trim()}` : ""}`,
-              runtimeSeconds,
-            });
-          }
-        });
-      });
-
-      // Feed the prompt via stdin, then close it.
-      try {
-        child.stdin?.write(ctx.prompt);
-        child.stdin?.end();
-      } catch {
-        /* child may have exited; close handler will settle. */
-      }
+      ctx.signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
   async checkAvailable(config: Config): Promise<AvailabilityResult> {
-    const { bin } = splitCommand(config.claude.command);
+    const { bin, args } = splitCommand(config.claude.command);
+    if (args.length > 0) {
+      // Wrapped command (e.g. `sandbox claude`): a bare `<bin> --version` does
+      // not validate the agent and may spin a sandbox, so just verify the
+      // wrapper is on PATH. Real launch failures surface on the first attempt.
+      const resolved = resolveOnPath(bin);
+      return resolved
+        ? { ok: true, detail: `wrapper "${bin}" → ${resolved}` }
+        : { ok: false, detail: `wrapper "${bin}" not found on PATH` };
+    }
     return new Promise((resolve) => {
       execFile(bin, ["--version"], { timeout: 10_000 }, (err, stdout) => {
         if (err) resolve({ ok: false, detail: `"${bin} --version" failed: ${err.message}` });
