@@ -132,6 +132,10 @@ adaptation suggested by `task +PENDING agent:codex` / `agent:claude`):
   loop. Knobs: `SYMPHONY_MOCK_STEPS`, `SYMPHONY_MOCK_STEP_MS`,
   `SYMPHONY_MOCK_FAIL=1`, `SYMPHONY_MOCK_STALL=1`.
 
+A driver's `command:` can route through a wrapper so the agent runs elsewhere —
+e.g. inside a disposable Docker sandbox (`command: sandbox claude --bedrock`).
+See [docs/dev-sandbox.md](./docs/dev-sandbox.md) for the full setup.
+
 ## Lifecycle & safety
 
 - **Claiming / locking.** The single-authority orchestrator claims issues
