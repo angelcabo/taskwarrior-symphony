@@ -151,7 +151,7 @@ async function cmdStart(args: Args): Promise<number> {
   const registry = buildRegistry();
   const orch = new Orchestrator({ workflow: wf, tracker, registry, logger: log });
 
-  const server = wf.config.http.enabled ? startHttpServer(orch, wf.config.http, log) : null;
+  const server = wf.config.http.enabled ? startHttpServer(orch, wf.config.http, log, args.workflow) : null;
   const stopWatch = watchWorkflow(args.workflow, log, (next) => orch.reload(next));
 
   let shuttingDown = false;

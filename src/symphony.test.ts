@@ -5,11 +5,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { renderPrompt, buildPromptContext, PromptError } from "./prompt.js";
 import { sanitizeKey, WorkspaceManager, WorkspaceError } from "./workspace.js";
 import { comparePriorityThenAge } from "./orchestrator.js";
 import { parseWorkflow, splitFrontMatter, expandPath, ConfigError } from "./config.js";
+import { applyConfigEdit, writeConfigEdit } from "./configedit.js";
 import { RetryQueue } from "./retry.js";
 import type { AgentConfig } from "./config.js";
 import type { Issue } from "./domain.js";
@@ -158,4 +162,81 @@ test("RetryQueue failure backoff follows min(base*2^(n-1), cap)", () => {
   assert.equal(q.failureDelay(3), 40_000);
   assert.equal(q.failureDelay(6), 300_000); // 320000 capped
   assert.equal(q.failureDelay(10), 300_000); // capped
+});
+
+// --- config edit (config API backing the board settings panel) --------------
+
+const EDITABLE_WORKFLOW = [
+  "---",
+  "# top comment — must survive edits",
+  "tracker:",
+  "  kind: taskwarrior",
+  "  data_dir: $HOME/keepme   # inline comment on an untouched key",
+  "  active_states: [todo, active]",
+  "agent:",
+  "  default_driver: claude",
+  "claude:",
+  "  command: claude",
+  "codex:",
+  "  command: codex",
+  "---",
+  "",
+  "# Task {{ issue.identifier }}",
+  "",
+  "Prompt body.",
+].join("\n");
+
+test("applyConfigEdit updates keys, preserving comments, $VAR, and body", () => {
+  const out = applyConfigEdit(EDITABLE_WORKFLOW, {
+    updates: { "agent.default_driver": "codex", "claude.command": "sandbox claude --bedrock" },
+  });
+  // Untouched comments and $VAR indirection survive (never resolved on write).
+  assert.match(out, /# top comment — must survive edits/);
+  assert.match(out, /# inline comment on an untouched key/);
+  assert.match(out, /\$HOME\/keepme/);
+  // Changes landed, and unrelated keys are intact.
+  assert.match(out, /default_driver: codex/);
+  assert.match(out, /command: sandbox claude --bedrock/);
+  assert.match(out, /codex:\n {2}command: codex/);
+  // The result still parses, reflects the change, and keeps the body verbatim.
+  const wf = parseWorkflow(out, "/tmp/WORKFLOW.md");
+  assert.equal(wf.config.agent.defaultDriver, "codex");
+  assert.equal(wf.config.claude.command, "sandbox claude --bedrock");
+  assert.match(wf.promptTemplate, /# Task \{\{ issue.identifier \}\}/);
+});
+
+test("applyConfigEdit creates nested keys and null resets a key", () => {
+  const created = applyConfigEdit(EDITABLE_WORKFLOW, { updates: { "codex.prompt_arg": true } });
+  assert.equal(parseWorkflow(created, "/tmp/WORKFLOW.md").config.codex.promptArg, true);
+
+  const reset = applyConfigEdit(created, { updates: { "codex.prompt_arg": null } });
+  assert.doesNotMatch(reset, /prompt_arg/); // key removed -> back to default (false)
+  assert.equal(parseWorkflow(reset, "/tmp/WORKFLOW.md").config.codex.promptArg, false);
+});
+
+test("applyConfigEdit can replace the whole front matter, keeping the body", () => {
+  const out = applyConfigEdit(EDITABLE_WORKFLOW, {
+    frontMatter: "tracker:\n  kind: taskwarrior\nagent:\n  default_driver: mock",
+  });
+  const wf = parseWorkflow(out, "/tmp/WORKFLOW.md");
+  assert.equal(wf.config.agent.defaultDriver, "mock");
+  assert.match(wf.promptTemplate, /Prompt body\./);
+});
+
+test("writeConfigEdit persists a valid edit and rejects an invalid one without writing", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sym-cfg-"));
+  const file = path.join(dir, "WORKFLOW.md");
+  writeFileSync(file, EDITABLE_WORKFLOW, "utf8");
+
+  const wf = await writeConfigEdit(file, { updates: { "agent.default_driver": "codex" } });
+  assert.equal(wf.config.agent.defaultDriver, "codex");
+  assert.match(readFileSync(file, "utf8"), /default_driver: codex/);
+
+  // An invalid edit (wrong type) must throw and leave the file untouched.
+  const before = readFileSync(file, "utf8");
+  await assert.rejects(
+    () => writeConfigEdit(file, { updates: { "polling.interval_ms": "not-a-number" } }),
+    ConfigError,
+  );
+  assert.equal(readFileSync(file, "utf8"), before);
 });

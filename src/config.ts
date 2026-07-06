@@ -92,6 +92,12 @@ export interface ClaudeConfig {
   model: string | null;
   allowedTools: string | null;
   extraArgs: string[];
+  /**
+   * Deliver the prompt as a positional CLI argument instead of on stdin. Needed
+   * when `command` routes through a wrapper that does not forward stdin to the
+   * agent (e.g. a Docker sandbox runner). Default false (stdin, per the SPEC).
+   */
+  promptArg: boolean;
 }
 
 export interface CodexConfig {
@@ -105,6 +111,8 @@ export interface CodexConfig {
   skipGitRepoCheck: boolean;
   model: string | null;
   extraArgs: string[];
+  /** Deliver the prompt as a positional arg instead of on stdin (see ClaudeConfig). */
+  promptArg: boolean;
 }
 
 export interface HttpConfig {
@@ -332,6 +340,7 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     model: optStr(claudeRaw, "model", "claude"),
     allowedTools: optStr(claudeRaw, "allowed_tools", "claude"),
     extraArgs: strArray(claudeRaw, "extra_args", [], "claude"),
+    promptArg: bool(claudeRaw, "prompt_arg", false, "claude"),
   };
 
   const codex: CodexConfig = {
@@ -341,6 +350,7 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     skipGitRepoCheck: bool(codexRaw, "skip_git_repo_check", true, "codex"),
     model: optStr(codexRaw, "model", "codex"),
     extraArgs: strArray(codexRaw, "extra_args", [], "codex"),
+    promptArg: bool(codexRaw, "prompt_arg", false, "codex"),
   };
 
   const httpRaw = asRecord(raw["http"], "http");
