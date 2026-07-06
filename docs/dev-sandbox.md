@@ -141,6 +141,30 @@ task add "write the RFC"  state:todo agent:claude
 
 ---
 
+## Editing config from the board
+
+You don't have to hand-edit `WORKFLOW.md`. With the HTTP API enabled
+(`http.enabled: true`), the **taskwarrior-kanban** board reads and edits the
+running config live — open its settings panel (the slider icon, or press `,`):
+
+- an **agents** form for the per-driver settings above (default driver,
+  concurrency, and each agent's command / model / permission-mode|sandbox and the
+  `prompt_arg` · `dangerously_bypass` · `skip_git_repo_check` toggles), and
+- a **raw yaml** tab for the whole front matter.
+
+Saves go to `PUT /api/v1/config`, which **validates before writing** (a bad edit
+is rejected and the file left untouched), preserves your comments and `$VAR`
+indirection, then hot-reloads the daemon. The same endpoints back any tooling:
+
+```sh
+curl -s localhost:4517/api/v1/config | jq .raw              # read the front matter
+curl -s -X PUT localhost:4517/api/v1/config \               # edit one field
+  -H content-type:application/json \
+  -d '{"updates":{"agent.default_driver":"codex"}}'
+```
+
+---
+
 ## Bedrock token
 
 Both agents on Bedrock need `AWS_BEARER_TOKEN_BEDROCK`. The wrapper can read
