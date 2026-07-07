@@ -279,6 +279,13 @@ export class TaskwarriorTracker implements Tracker {
     this.log.debug("tracker state transition", { issue_id: id, state });
   }
 
+  async annotate(id: string, text: string): Promise<void> {
+    // `--` forces literal text: without it Taskwarrior parses e.g. "agent: …" in
+    // the annotation as an attribute assignment and rejects/mangles it.
+    await this.runTask([id], "annotate", ["--", text]);
+    this.log.debug("tracker annotate", { issue_id: id });
+  }
+
   async preflight(): Promise<void> {
     // Verifies the binary runs and the data store is reachable.
     await this.runTask(["status:pending"], "count");

@@ -6,6 +6,15 @@
  * below; nothing downstream of the adapter knows about Taskwarrior.
  */
 
+/**
+ * Workspace-relative path where an agent writes its handoff, for agents that
+ * cannot reach the tracker directly (sandboxed, or a permission mode that blocks
+ * shell). Writing a file uses the agent's file-write tool (typically
+ * auto-approved), and the orchestrator applies the transition host-side after
+ * the turn. Format: JSON `{"state":"review","summary":"…"}` or `{"blocked":"…"}`.
+ */
+export const HANDOFF_RELATIVE_PATH = ".symphony/handoff.json";
+
 /** A single blocking relationship, normalized from the tracker's "blocks" graph. */
 export interface Blocker {
   /** Stable id of the blocking issue. */
@@ -100,7 +109,13 @@ export type RuntimeEvent =
   | { type: "turn_cancelled"; ts: number }
   | { type: "approval_auto_approved"; ts: number; what: string }
   | { type: "unsupported_tool_call"; ts: number; name: string }
-  | { type: "tool_call"; ts: number; name: string }
+  // Rich transcript events (full observability — "as if watching Claude Code"):
+  // the agent's own prose, its reasoning, the exact tool inputs it chose, and the
+  // results it saw back. `data` on the stream carries these verbatim (truncated).
+  | { type: "assistant_message"; ts: number; text: string }
+  | { type: "thinking"; ts: number; text: string }
+  | { type: "tool_call"; ts: number; name: string; input?: unknown; id?: string }
+  | { type: "tool_result"; ts: number; name?: string; toolUseId?: string; content: string; isError?: boolean }
   | { type: "log"; ts: number; level: "debug" | "info" | "warn" | "error"; message: string }
   | { type: "usage"; ts: number; usage: TokenUsage };
 

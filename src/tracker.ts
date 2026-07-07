@@ -41,6 +41,14 @@ export interface Tracker {
    */
   transitionState(id: string, state: string): Promise<void>;
 
+  /**
+   * Append an annotation to an issue. Used to record the agent's handoff summary
+   * or blocker when the agent cannot reach the tracker itself (e.g. it runs in a
+   * sandbox, or under a permission mode that blocks shell) and instead writes a
+   * handoff file that the orchestrator applies on the host.
+   */
+  annotate(id: string, text: string): Promise<void>;
+
   /** Validate the tracker is reachable/usable (dispatch preflight, SPEC §3). */
   preflight(): Promise<void>;
 }

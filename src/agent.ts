@@ -122,6 +122,46 @@ export function parseJsonLine(line: string): Record<string, unknown> | null {
   return null;
 }
 
+// --- Transcript helpers (shared by drivers for rich observability) -----------
+// Per-event size caps: keep the agent's words/inputs/outputs observable while
+// bounding the per-task replay buffer the stream retains.
+export const TRANSCRIPT_TEXT_MAX = 4000;
+export const TOOL_INPUT_MAX = 2000;
+export const TOOL_RESULT_MAX = 2000;
+
+/** Clip a string to `n` chars with a count suffix (no-op if already short). */
+export function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + `… (+${s.length - n} chars)` : s;
+}
+
+/** Flatten a tool result (string | content-blocks[] | object) to display text. */
+export function flattenToolContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => {
+        if (typeof b === "string") return b;
+        const x = b as { type?: string; text?: string };
+        if (x?.type === "text" && typeof x.text === "string") return x.text;
+        return JSON.stringify(b);
+      })
+      .join("\n");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
+/** Keep a tool input structured, but cap giant payloads (e.g. file bodies). */
+export function clampToolInput(input: unknown, max = TOOL_INPUT_MAX): unknown {
+  if (input == null) return input;
+  let s: string;
+  try {
+    s = JSON.stringify(input);
+  } catch {
+    return "[unserializable input]";
+  }
+  return s.length <= max ? input : truncate(s, max);
+}
+
 /**
  * Resolve an executable by name against $PATH (or check an explicit path)
  * without executing it. A lightweight availability probe for commands that

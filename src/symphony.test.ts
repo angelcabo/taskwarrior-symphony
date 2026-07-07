@@ -142,6 +142,62 @@ test("parseWorkflow rejects malformed types", () => {
   assert.throws(() => parseWorkflow(text, "/tmp/WORKFLOW.md"), ConfigError);
 });
 
+// --- beyond-SPEC give-up guardrail (agent.max_attempts + tracker.give_up_transition) ---
+
+test("parseWorkflow parses the give-up knobs", () => {
+  const text = [
+    "---",
+    "tracker:",
+    "  kind: taskwarrior",
+    "  active_states: [todo, active]",
+    "  give_up_transition: review",
+    "agent:",
+    "  default_driver: mock",
+    "  max_attempts: 6",
+    "---",
+    "body",
+  ].join("\n");
+  const wf = parseWorkflow(text, "/tmp/WORKFLOW.md");
+  assert.equal(wf.config.agent.maxAttempts, 6);
+  assert.equal(wf.config.tracker.giveUpTransition, "review");
+});
+
+test("parseWorkflow: unset give-up knobs => null (SPEC behavior: unlimited, never gives up)", () => {
+  const text = "---\ntracker:\n  kind: taskwarrior\n  active_states: [todo]\n---\nbody";
+  const wf = parseWorkflow(text, "/tmp/WORKFLOW.md");
+  assert.equal(wf.config.agent.maxAttempts, null);
+  assert.equal(wf.config.tracker.giveUpTransition, null);
+});
+
+test("parseWorkflow: max_attempts without give_up_transition is rejected", () => {
+  const text = [
+    "---",
+    "tracker:",
+    "  kind: taskwarrior",
+    "  active_states: [todo, active]",
+    "agent:",
+    "  max_attempts: 6",
+    "---",
+    "body",
+  ].join("\n");
+  assert.throws(() => parseWorkflow(text, "/tmp/WORKFLOW.md"), ConfigError);
+});
+
+test("parseWorkflow: max_attempts must be >= 1", () => {
+  const text = [
+    "---",
+    "tracker:",
+    "  kind: taskwarrior",
+    "  active_states: [todo, active]",
+    "  give_up_transition: review",
+    "agent:",
+    "  max_attempts: 0",
+    "---",
+    "body",
+  ].join("\n");
+  assert.throws(() => parseWorkflow(text, "/tmp/WORKFLOW.md"), ConfigError);
+});
+
 test("expandPath expands ~ and resolves relative to base dir", () => {
   assert.ok(expandPath("~/x", "/base").endsWith("/x"));
   assert.equal(expandPath("rel/dir", "/base"), "/base/rel/dir");
