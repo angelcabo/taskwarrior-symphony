@@ -33,6 +33,11 @@ import {
   parseJsonLine,
   resolveOnPath,
   spawnLines,
+  truncate,
+  flattenToolContent,
+  clampToolInput,
+  TRANSCRIPT_TEXT_MAX,
+  TOOL_RESULT_MAX,
   SANDBOX_ATTACH_AUTORESPOND,
 } from "../agent.js";
 import type { Config } from "../config.js";
@@ -90,6 +95,8 @@ export class ClaudeDriver implements AgentDriver {
     return new Promise<RunResult>((resolve, reject) => {
       let proc: LineProcess;
       let sessionId = ctx.sessionId;
+      // tool_use id -> tool name, so tool_result events can name their tool.
+      const toolNames = new Map<string, string>();
       let finalResult: RunResult | null = null;
       let killed = false;
       let settled = false;
@@ -123,18 +130,50 @@ export class ClaudeDriver implements AgentDriver {
         } else if (type === "assistant") {
           const message = obj["message"] as { content?: unknown[] } | undefined;
           const content = Array.isArray(message?.content) ? message!.content : [];
-          let hadTool = false;
+          let emitted = false;
           for (const block of content) {
-            const b = block as { type?: string; name?: string };
-            if (b.type === "tool_use") {
-              hadTool = true;
-              emit({ type: "tool_call", ts: Date.now(), name: b.name ?? "tool" });
+            const b = block as {
+              type?: string;
+              text?: string;
+              thinking?: string;
+              name?: string;
+              input?: unknown;
+              id?: string;
+            };
+            if (b.type === "text" && typeof b.text === "string" && b.text.trim() !== "") {
+              emitted = true;
+              emit({ type: "assistant_message", ts: Date.now(), text: truncate(b.text, TRANSCRIPT_TEXT_MAX) });
+            } else if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim() !== "") {
+              emitted = true;
+              emit({ type: "thinking", ts: Date.now(), text: truncate(b.thinking, TRANSCRIPT_TEXT_MAX) });
+            } else if (b.type === "tool_use") {
+              emitted = true;
+              if (b.id && b.name) toolNames.set(b.id, b.name);
+              emit({ type: "tool_call", ts: Date.now(), name: b.name ?? "tool", input: clampToolInput(b.input), id: b.id });
             }
           }
-          if (!hadTool) emit({ type: "turn_started", ts: Date.now() });
+          // Fallback activity ping if the message carried nothing we surface.
+          if (!emitted) emit({ type: "turn_started", ts: Date.now() });
         } else if (type === "user") {
-          // Tool results streaming back — counts as activity.
-          emit({ type: "log", ts: Date.now(), level: "debug", message: "tool_result" });
+          // Tool results streaming back — surface content + ok/error per tool.
+          const message = obj["message"] as { content?: unknown[] } | undefined;
+          const content = Array.isArray(message?.content) ? message!.content : [];
+          let emitted = false;
+          for (const block of content) {
+            const b = block as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
+            if (b.type === "tool_result") {
+              emitted = true;
+              emit({
+                type: "tool_result",
+                ts: Date.now(),
+                name: b.tool_use_id ? toolNames.get(b.tool_use_id) : undefined,
+                toolUseId: b.tool_use_id,
+                content: truncate(flattenToolContent(b.content), TOOL_RESULT_MAX),
+                isError: b.is_error === true,
+              });
+            }
+          }
+          if (!emitted) emit({ type: "log", ts: Date.now(), level: "debug", message: "tool_result" });
         } else if (type === "result") {
           const isError = obj["is_error"] === true || obj["subtype"] !== "success";
           sessionId = (obj["session_id"] as string) ?? sessionId;

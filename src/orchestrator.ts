@@ -23,6 +23,7 @@ import {
   type RuntimeEvent,
   addUsage,
   emptyTotals,
+  HANDOFF_RELATIVE_PATH,
 } from "./domain.js";
 import type { Config, Workflow } from "./config.js";
 import type { Tracker, IssueStateSnapshot } from "./tracker.js";
@@ -33,6 +34,8 @@ import { runAttempt } from "./runner.js";
 import { reconcile } from "./reconciler.js";
 import { TaskStreamHub } from "./taskstream.js";
 import { Logger } from "./logger.js";
+import { readFile, rm } from "node:fs/promises";
+import path from "node:path";
 
 export type AbortReason = "stall" | "terminal" | "neither" | "shutdown";
 
@@ -80,6 +83,8 @@ export class Orchestrator {
   private readonly running = new Map<string, RunningEntry>(); // active issues
   private readonly claimed = new Set<string>(); // running OR retrying
   private readonly continuationCounts = new Map<string, number>();
+  /** Beyond-SPEC: total agent runs per issue this daemon-lifetime, for `agent.max_attempts`. */
+  private readonly attemptsByIssue = new Map<string, number>();
   private readonly totals: AgentTotals = emptyTotals();
 
   private interval: NodeJS.Timeout | null = null;
@@ -319,6 +324,7 @@ export class Orchestrator {
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
+    this.attemptsByIssue.set(issue.id, (this.attemptsByIssue.get(issue.id) ?? 0) + 1);
 
     const logc = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     logc.info("dispatch", {
@@ -430,6 +436,10 @@ export class Orchestrator {
     }
 
     if (outcome === "Failed" || outcome === "TimedOut" || outcome === "Stalled") {
+      if (this.overBudget(issue.id)) {
+        await this.giveUp(issue, `repeated failure (${outcome})`);
+        return;
+      }
       this.scheduleFailureRetry(entry, result.error ?? outcome);
       return;
     }
@@ -438,9 +448,68 @@ export class Orchestrator {
     await this.handleSuccess(entry);
   }
 
+  /**
+   * Apply an agent's handoff file if present. The agent writes
+   * `<workspace>/.symphony/handoff.json` (HANDOFF_RELATIVE_PATH) using its file
+   * tool — which works even when it cannot run `task` (sandboxed, or a permission
+   * mode that blocks shell). We apply the requested transition/annotation on the
+   * host, then delete the file so a stale handoff can't re-fire next attempt.
+   * Applied before the post-turn state re-read, so a non-active handoff state is
+   * what ends the continuation loop.
+   */
+  private async applyHandoff(entry: RunningEntry, logc: Logger): Promise<void> {
+    const file = path.join(this.workspaces.pathFor(entry.issue.identifier), HANDOFF_RELATIVE_PATH);
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch {
+      return; // no handoff file — agent used `task` directly, or hasn't handed off
+    }
+    await rm(file, { force: true }).catch(() => undefined);
+    const h = parseHandoff(raw);
+    if (!h) {
+      logc.warn("handoff file present but unparseable; ignoring", { file });
+      return;
+    }
+    // The state transition is the loop-breaker: apply it first, and never let a
+    // failed annotation block it.
+    if (h.state) {
+      try {
+        await this.tracker.transitionState(entry.issue.id, h.state);
+        logc.info("handoff applied", { state: h.state, summary: h.summary });
+        this.streams.publish(entry.issue, {
+          kind: "handoff",
+          message: `handoff · state=${h.state}${h.summary ? ` · ${h.summary}` : ""}`,
+          data: { state: h.state, summary: h.summary },
+        });
+      } catch (err) {
+        logc.warn("handoff state transition failed", { error: String(err) });
+      }
+    }
+    try {
+      if (h.summary) await this.tracker.annotate(entry.issue.id, `agent: ${h.summary}`);
+      if (h.blocked) await this.tracker.annotate(entry.issue.id, `agent blocked: ${h.blocked}`);
+    } catch (err) {
+      logc.warn("handoff annotate failed (non-fatal)", { error: String(err) });
+    }
+    if (h.blocked && !h.state) {
+      logc.info("handoff: blocker recorded", { blocked: h.blocked });
+      this.streams.publish(entry.issue, {
+        kind: "handoff",
+        message: `handoff · blocked · ${h.blocked}`,
+        data: { blocked: h.blocked },
+      });
+    }
+  }
+
   private async handleSuccess(entry: RunningEntry): Promise<void> {
     const { issue } = entry;
     const logc = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
+
+    // Honor an agent handoff file (agents that can't reach the tracker directly),
+    // applied host-side BEFORE we re-read state — a requested non-active state is
+    // what ends the continuation loop below.
+    await this.applyHandoff(entry, logc);
 
     let snap: IssueStateSnapshot | undefined;
     try {
@@ -455,6 +524,13 @@ export class Orchestrator {
     }
     if (snap && (!snap.exists || !snap.active)) {
       await this.finalizeTerminal(entry, false);
+      return;
+    }
+
+    // Beyond-SPEC safety: give up if the attempt budget is spent without a handoff,
+    // so a task that never self-transitions can't loop (and bill) forever.
+    if (this.overBudget(issue.id)) {
+      await this.giveUp(issue, "no handoff within attempt budget");
       return;
     }
 
@@ -474,6 +550,49 @@ export class Orchestrator {
     this.retryQueue.scheduleContinuation(issue, entry.sessionId, (e) => this.onRetryFire(e));
   }
 
+  /** Beyond-SPEC: has this issue used up its configured attempt budget? */
+  private overBudget(issueId: string): boolean {
+    const max = this._config.agent.maxAttempts;
+    return max != null && (this.attemptsByIssue.get(issueId) ?? 0) >= max;
+  }
+
+  /**
+   * Beyond-SPEC safety net: the issue burned through `agent.max_attempts` runs
+   * without ever handing off. Annotate why, park it in `tracker.give_up_transition`
+   * (a non-active state, so it stops being a dispatch candidate), and release it.
+   * The SPEC has no such path — it assumes the agent always hands off — so this is
+   * strictly additive and only reachable when max_attempts is configured.
+   */
+  private async giveUp(issue: Issue, reason: string): Promise<void> {
+    const attempts = this.attemptsByIssue.get(issue.id) ?? 0;
+    const target = this._config.tracker.giveUpTransition!; // guaranteed set by config validation
+    const logc = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
+    logc.warn("giving up: attempt budget exhausted without handoff", { attempts, reason, park_state: target });
+    try {
+      await this.tracker.annotate(
+        issue.id,
+        `symphony: gave up after ${attempts} attempt(s) without handoff (${reason}); parked in ${target} for review`,
+      );
+    } catch (err) {
+      logc.warn("give-up annotate failed (non-fatal)", { error: String(err) });
+    }
+    try {
+      await this.tracker.transitionState(issue.id, target);
+    } catch (err) {
+      logc.warn("give-up transition failed", { error: String(err) });
+    }
+    this.streams.publish(issue, {
+      kind: "gave_up",
+      message: `gave up after ${attempts} attempt(s) · parked in ${target} · ${reason}`,
+      data: { attempts, state: target, reason },
+    });
+    this.continuationCounts.delete(issue.id);
+    this.attemptsByIssue.delete(issue.id);
+    this.retryQueue.cancel(issue.id);
+    this.releaseClaim(issue.id);
+    this.streams.end(issue);
+  }
+
   private scheduleFailureRetry(entry: RunningEntry, error: string): void {
     this.claimed.add(entry.issue.id); // retrying => claimed
     this.streams.publish(entry.issue, { kind: "retry_scheduled", message: `retry scheduled · ${error}` });
@@ -484,6 +603,7 @@ export class Orchestrator {
     const { issue } = entry;
     const logc = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     this.continuationCounts.delete(issue.id);
+    this.attemptsByIssue.delete(issue.id);
     this.retryQueue.cancel(issue.id);
     if (cleanup) {
       try {
@@ -531,6 +651,7 @@ export class Orchestrator {
       }
       this.releaseClaim(entry.issueId);
       this.continuationCounts.delete(entry.issueId);
+      this.attemptsByIssue.delete(entry.issueId);
       logc.info("retry: issue no longer active; finalized", { workspace_cleaned: cleaned });
       return;
     }
@@ -542,6 +663,7 @@ export class Orchestrator {
         // Ineligible for a non-capacity reason (blockers / state) → release.
         this.releaseClaim(issue.id);
         this.continuationCounts.delete(issue.id);
+        this.attemptsByIssue.delete(issue.id);
         logc.info("retry: no longer eligible; released claim", {});
       } else {
         this.retryQueue.requeue(entry, requeueDelay, (e) => this.onRetryFire(e));
@@ -653,6 +775,55 @@ export class Orchestrator {
 }
 
 /** A short, human-readable line for a runtime event, shown by `symphony watch`. */
+/** First non-blank line of a string, clipped — for cosmetic one-liners. */
+function firstLine(s: string, max = 120): string {
+  const line = (s ?? "").split("\n").find((l) => l.trim() !== "") ?? "";
+  return line.length > max ? line.slice(0, max) + "…" : line;
+}
+
+/** Compact one-line summary of a tool_use input, favoring the telling field. */
+function compactInput(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input === "string") return firstLine(input, 80);
+  const o = input as Record<string, unknown>;
+  const key = o.command ?? o.file_path ?? o.path ?? o.pattern ?? o.query ?? o.url;
+  if (typeof key === "string") return firstLine(key, 80);
+  try {
+    return firstLine(JSON.stringify(input), 80);
+  } catch {
+    return "";
+  }
+}
+
+interface Handoff {
+  state?: string;
+  summary?: string;
+  blocked?: string;
+}
+
+/** Parse an agent handoff file: JSON preferred, with a lenient key:value fallback. */
+function parseHandoff(raw: string): Handoff | null {
+  const t = raw.trim();
+  if (!t) return null;
+  const pick = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+  try {
+    const j = JSON.parse(t) as Record<string, unknown>;
+    if (j && typeof j === "object" && !Array.isArray(j)) {
+      const h: Handoff = { state: pick(j.state), summary: pick(j.summary), blocked: pick(j.blocked) };
+      return h.state || h.summary || h.blocked ? h : null;
+    }
+  } catch {
+    /* not JSON — fall back to `key: value` line parsing */
+  }
+  const h: Handoff = {};
+  for (const line of t.split("\n")) {
+    const m = /^\s*(state|summary|blocked)\s*[:=]\s*(.+?)\s*$/i.exec(line);
+    if (m && m[1] && m[2]) (h as Record<string, string>)[m[1].toLowerCase()] = m[2].replace(/^["']|["']$/g, "");
+  }
+  return h.state || h.summary || h.blocked ? h : null;
+}
+
 function streamMessage(e: RuntimeEvent): string {
   switch (e.type) {
     case "session_started":
@@ -669,8 +840,14 @@ function streamMessage(e: RuntimeEvent): string {
       return `auto-approved: ${e.what}`;
     case "unsupported_tool_call":
       return `unsupported tool: ${e.name}`;
+    case "assistant_message":
+      return `💬 ${firstLine(e.text)}`;
+    case "thinking":
+      return `🤔 ${firstLine(e.text)}`;
     case "tool_call":
-      return `tool · ${e.name}`;
+      return `🔧 ${e.name}${e.input !== undefined ? ` ${compactInput(e.input)}` : ""}`;
+    case "tool_result":
+      return `↳ ${e.isError ? "error" : "ok"}${e.name ? ` ${e.name}` : ""} · ${firstLine(e.content)}`;
     case "log":
       return e.message;
     case "usage":

@@ -306,9 +306,62 @@ async function cmdWatch(args: Args): Promise<number> {
     });
   }
 
-  const fmt = (ev: { ts?: number; kind: string; message?: string }): string => {
-    const t = new Date(ev.ts ?? Date.now()).toTimeString().slice(0, 8);
-    return `  ${t}  ${String(ev.kind).padEnd(16)} ${ev.message ?? ""}`.replace(/\s+$/, "");
+  // ANSI helpers — `watch` is an interactive transcript view (Claude-Code-like).
+  const useColor = process.stdout.isTTY;
+  const c = (code: string, s: string): string => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+  const dim = (s: string) => c("2", s);
+  const bold = (s: string) => c("1", s);
+  const cyan = (s: string) => c("36", s);
+  const green = (s: string) => c("32", s);
+  const red = (s: string) => c("31", s);
+  const yellow = (s: string) => c("33", s);
+  const indent = (s: string, pad = "      "): string =>
+    (s ?? "")
+      .replace(/\s+$/, "")
+      .split("\n")
+      .map((l) => pad + l)
+      .join("\n");
+  const toolInput = (input: unknown): string => {
+    if (input == null) return "";
+    if (typeof input === "string") return input;
+    const o = input as Record<string, unknown>;
+    if (typeof o.command === "string") return String(o.command);
+    try {
+      return JSON.stringify(input, null, 2);
+    } catch {
+      return String(input);
+    }
+  };
+
+  const fmt = (ev: { ts?: number; kind: string; message?: string; data?: Record<string, unknown> }): string => {
+    const t = dim(new Date(ev.ts ?? Date.now()).toTimeString().slice(0, 8));
+    const d = ev.data ?? {};
+    switch (ev.kind) {
+      case "thinking":
+        return `  ${t}  ${dim("🤔 thinking")}\n${dim(indent(String(d.text ?? "")))}`;
+      case "assistant_message":
+        return `  ${t}  ${cyan("💬 assistant")}\n${indent(String(d.text ?? ""))}`;
+      case "tool_call": {
+        const head = `  ${t}  ${yellow("🔧 " + String(d.name ?? "tool"))}`;
+        const body = toolInput(d.input);
+        return body ? `${head}\n${dim(indent(body))}` : head;
+      }
+      case "tool_result": {
+        const ok = d.isError ? red("↳ error") : green("↳ result");
+        const name = d.name ? dim(` ${String(d.name)}`) : "";
+        const body = String(d.content ?? "");
+        return `  ${t}  ${ok}${name}${body ? "\n" + dim(indent(body)) : ""}`;
+      }
+      case "session_started":
+        return `  ${t}  ${bold("● session started")} ${dim(ev.message ?? "")}`.replace(/\s+$/, "");
+      case "turn_completed":
+      case "turn_failed":
+      case "finalized":
+      case "end":
+        return `  ${t}  ${bold(String(ev.kind))} ${ev.message ?? ""}`.replace(/\s+$/, "");
+      default:
+        return `  ${t}  ${String(ev.kind).padEnd(16)} ${ev.message ?? ""}`.replace(/\s+$/, "");
+    }
   };
 
   const reader = res.body.getReader();

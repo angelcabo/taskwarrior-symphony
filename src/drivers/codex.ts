@@ -35,6 +35,11 @@ import {
   parseJsonLine,
   resolveOnPath,
   spawnLines,
+  truncate,
+  flattenToolContent,
+  clampToolInput,
+  TRANSCRIPT_TEXT_MAX,
+  TOOL_RESULT_MAX,
   SANDBOX_ATTACH_AUTORESPOND,
 } from "../agent.js";
 import type { Config } from "../config.js";
@@ -112,8 +117,75 @@ export class CodexDriver implements AgentDriver {
         setTimeout(() => proc.kill("SIGKILL"), 2000);
       };
 
-      const isToolItem = (type: string | undefined): boolean =>
-        type !== undefined && type !== "agent_message" && type !== "reasoning";
+      // Map a codex `item` (started or completed phase) to rich transcript events,
+      // mirroring the claude driver: agent_message -> assistant_message, reasoning
+      // -> thinking, command_execution -> tool_call (command) + tool_result (output),
+      // file_change / mcp_tool_call / unknown -> tool_call (+ tool_result) with input.
+      const emitItem = (phase: "started" | "completed", item: Record<string, unknown> | undefined) => {
+        if (!item) return;
+        const type = typeof item["type"] === "string" ? (item["type"] as string) : "item";
+        const id = typeof item["id"] === "string" ? (item["id"] as string) : undefined;
+        const text = typeof item["text"] === "string" ? (item["text"] as string) : "";
+        switch (type) {
+          case "agent_message":
+            if (phase === "completed" && text.trim() !== "")
+              emit({ type: "assistant_message", ts: Date.now(), text: truncate(text, TRANSCRIPT_TEXT_MAX) });
+            return;
+          case "reasoning":
+            if (phase === "completed" && text.trim() !== "")
+              emit({ type: "thinking", ts: Date.now(), text: truncate(text, TRANSCRIPT_TEXT_MAX) });
+            return;
+          case "command_execution": {
+            const command = typeof item["command"] === "string" ? (item["command"] as string) : "";
+            if (phase === "started") {
+              emit({ type: "tool_call", ts: Date.now(), name: "shell", input: command || clampToolInput(item), id });
+            } else {
+              const out = flattenToolContent(item["aggregated_output"] ?? item["output"] ?? "");
+              const exit = typeof item["exit_code"] === "number" ? (item["exit_code"] as number) : undefined;
+              emit({
+                type: "tool_result",
+                ts: Date.now(),
+                name: "shell",
+                toolUseId: id,
+                content: truncate(out, TOOL_RESULT_MAX),
+                isError: exit !== undefined && exit !== 0,
+              });
+            }
+            return;
+          }
+          case "file_change":
+            if (phase === "completed")
+              emit({ type: "tool_call", ts: Date.now(), name: "file_change", input: clampToolInput(item["changes"] ?? item), id });
+            return;
+          case "mcp_tool_call": {
+            const label = [item["server"], item["tool"]].filter(Boolean).join("/") || "mcp_tool";
+            if (phase === "started") {
+              emit({ type: "tool_call", ts: Date.now(), name: label, input: clampToolInput(item["arguments"] ?? item), id });
+            } else if (item["result"] !== undefined) {
+              emit({
+                type: "tool_result",
+                ts: Date.now(),
+                name: label,
+                toolUseId: id,
+                content: truncate(flattenToolContent(item["result"]), TOOL_RESULT_MAX),
+                isError: item["status"] === "failed",
+              });
+            }
+            return;
+          }
+          default:
+            // Unknown item type: surface once (on completed) as a tool_call whose
+            // input is the item's salient fields, so nothing is silently dropped.
+            if (phase === "completed") {
+              const { type: _t, id: _i, status: _s, ...rest } = item;
+              void _t;
+              void _i;
+              void _s;
+              const input = Object.keys(rest).length > 0 ? rest : item;
+              emit({ type: "tool_call", ts: Date.now(), name: type, input: clampToolInput(input), id });
+            }
+        }
+      };
 
       const handleLine = (line: string) => {
         const obj = parseJsonLine(line);
@@ -122,7 +194,7 @@ export class CodexDriver implements AgentDriver {
           if (t !== "") ctx.log.debug("codex: non-JSON line", { line: t.slice(0, 200) });
           return;
         }
-        const item = obj["item"] as { type?: string; name?: string } | undefined;
+        const item = obj["item"] as Record<string, unknown> | undefined;
         switch (obj["type"]) {
           case "thread.started":
             sessionId = (obj["thread_id"] as string) ?? sessionId;
@@ -132,12 +204,10 @@ export class CodexDriver implements AgentDriver {
             emit({ type: "turn_started", ts: Date.now() });
             break;
           case "item.started":
+            emitItem("started", item);
+            break;
           case "item.completed":
-            if (isToolItem(item?.type)) {
-              emit({ type: "tool_call", ts: Date.now(), name: item?.type ?? "item" });
-            } else {
-              emit({ type: "log", ts: Date.now(), level: "debug", message: item?.type ?? "item" });
-            }
+            emitItem("completed", item);
             break;
           case "turn.completed":
             usage = mapUsage(obj["usage"] as CodexUsage | undefined);

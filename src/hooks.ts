@@ -10,7 +10,8 @@
  */
 
 import { spawn } from "node:child_process";
-import type { Issue } from "./domain.js";
+import path from "node:path";
+import { type Issue, HANDOFF_RELATIVE_PATH } from "./domain.js";
 import { Logger } from "./logger.js";
 
 export interface HookResult {
@@ -47,6 +48,9 @@ export function buildIssueEnv(
     SYMPHONY_BRANCH: issue.branchName,
     SYMPHONY_WORKSPACE: workspacePath,
     SYMPHONY_ATTEMPT: attempt === null ? "" : String(attempt),
+    // Absolute path (identical on host and inside an identical-path sandbox mount)
+    // where the agent writes its handoff; the orchestrator applies it host-side.
+    SYMPHONY_HANDOFF_FILE: path.join(workspacePath, HANDOFF_RELATIVE_PATH),
   };
 }
 

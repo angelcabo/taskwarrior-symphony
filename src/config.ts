@@ -47,6 +47,14 @@ export interface TrackerConfig {
    * The SPEC keeps claiming purely in-memory; null preserves that behavior.
    */
   dispatchTransition: string | null;
+  /**
+   * Adaptation (beyond SPEC): the non-active state an issue is parked in when it
+   * exhausts `agent.max_attempts` without handing off. Required when max_attempts
+   * is set — there must be somewhere to move an abandoned issue so it stops being
+   * a dispatch candidate. The SPEC has no give-up path (it assumes the agent
+   * always hands off), so this is null unless configured.
+   */
+  giveUpTransition: string | null;
 }
 
 export interface PollingConfig {
@@ -70,6 +78,13 @@ export interface AgentConfig {
   maxConcurrentAgents: number;
   maxConcurrentAgentsByState: Record<string, number>;
   maxTurns: number | null;
+  /**
+   * Adaptation (beyond SPEC): hard cap on total agent runs (dispatches +
+   * continuations + retries) for one issue before Symphony gives up and parks it
+   * in `tracker.give_up_transition`. null = unlimited, i.e. SPEC behavior — the
+   * SPEC assumes the agent always eventually hands off, so it defines no cap.
+   */
+  maxAttempts: number | null;
   /** Base of the failure backoff formula (SPEC: 10000). */
   baseRetryMs: number;
   /** Cap on failure backoff (SPEC default 300000). */
@@ -280,6 +295,7 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     agentAttr: str(trackerRaw, "agent_attr", "agent", "tracker"),
     branchAttr: str(trackerRaw, "branch_attr", "branch", "tracker"),
     dispatchTransition: optStr(trackerRaw, "dispatch_transition", "tracker"),
+    giveUpTransition: optStr(trackerRaw, "give_up_transition", "tracker"),
   };
   if (tracker.activeStates.length === 0) {
     throw new ConfigError("tracker.active_states must list at least one state");
@@ -309,6 +325,7 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     maxConcurrentAgents: num(agentRaw, "max_concurrent_agents", 10, "agent"),
     maxConcurrentAgentsByState: numMap(agentRaw, "max_concurrent_agents_by_state", "agent"),
     maxTurns: optNum(agentRaw, "max_turns", "agent"),
+    maxAttempts: optNum(agentRaw, "max_attempts", "agent"),
     baseRetryMs: num(agentRaw, "base_retry_ms", 10_000, "agent"),
     maxRetryBackoffMs: num(agentRaw, "max_retry_backoff_ms", 300_000, "agent"),
     continuationDelayMs: num(agentRaw, "continuation_delay_ms", 1_000, "agent"),
@@ -328,6 +345,14 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     defaultDriver: str(agentRaw, "default_driver", "claude", "agent"),
   };
   if (agent.maxConcurrentAgents < 1) throw new ConfigError("agent.max_concurrent_agents must be >= 1");
+  if (agent.maxAttempts != null && agent.maxAttempts < 1) {
+    throw new ConfigError("agent.max_attempts must be >= 1 (omit it for unlimited)");
+  }
+  if (agent.maxAttempts != null && !tracker.giveUpTransition) {
+    throw new ConfigError(
+      "agent.max_attempts requires tracker.give_up_transition — a non-active state to park an issue in when it gives up without handing off",
+    );
+  }
 
   const claudeRaw = asRecord(raw["claude"], "claude");
   const permissionMode = str(claudeRaw, "permission_mode", "acceptEdits", "claude") as ClaudePermissionMode;
@@ -376,7 +401,14 @@ export function parseWorkflow(text: string, sourcePath: string): Workflow {
     } catch (err) {
       throw new ConfigError(`Invalid YAML front matter: ${(err as Error).message}`);
     }
-    rawConfig = deepResolveEnv(asRecord(parsed, "front matter"));
+    // Hooks are shell scripts: their $VARS (incl. per-issue runtime vars like
+    // $SYMPHONY_BRANCH, only set by buildIssueEnv at run time) must be expanded
+    // by the shell when the hook runs, not baked in at load time. Resolve $VAR
+    // everywhere else; leave hook bodies literal.
+    const rec = asRecord(parsed, "front matter");
+    const { hooks, ...rest } = rec;
+    rawConfig = deepResolveEnv(rest);
+    if (hooks !== undefined) rawConfig.hooks = hooks;
   }
 
   const config = buildConfig(rawConfig, sourceDir);

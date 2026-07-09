@@ -110,22 +110,27 @@ Complete the task below end-to-end, then hand it off for human review.
 ## Definition of Done
 - The change is implemented and committed on `{{ issue.branch_name }}`.
 - The test suite passes locally.
-- A one-line summary of the work is recorded on the task.
+- The handoff file is written (see below).
 
 ## Handoff (required)
-Symphony writes nothing to the tracker on your behalf — **you** perform the handoff.
-When the Definition of Done is met, record a summary and move the task to `review`
-(a human-review state Symphony will not auto-continue):
+Perform the handoff by **writing a file** — not by running `task`. You may be
+running in a sandbox or under a permission mode that blocks shell, but your
+file-write tool works, so write the handoff to `.symphony/handoff.json` in the
+workspace root (also available as the absolute path `$SYMPHONY_HANDOFF_FILE`).
+Symphony reads it on the host and applies the transition for you.
 
-```sh
-task {{ issue.id }} annotate "agent: <one-line summary of the change>"
-task {{ issue.id }} modify state:review
+When the Definition of Done is met, write JSON with a `review` state (a
+human-review state Symphony will not auto-continue) and a one-line summary:
+
+```json
+{"state": "review", "summary": "<one-line summary of the change>"}
 ```
 
-If you are blocked and cannot finish, record why and leave the task in its current state:
+If you are blocked and cannot finish, write a blocker instead:
 
-```sh
-task {{ issue.id }} annotate "agent blocked: <reason>"
+```json
+{"blocked": "<reason>"}
 ```
 
-Do not stop until you have either handed off (`state:review`) or recorded a blocker.
+Do not stop until you have written `.symphony/handoff.json` with either a
+`state` (you finished) or a `blocked` reason.

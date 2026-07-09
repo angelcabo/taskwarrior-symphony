@@ -162,6 +162,14 @@ See [docs/dev-sandbox.md](./docs/dev-sandbox.md) for the full setup.
 - **Continuation cap** (`SYMPHONY_MAX_CONTINUATIONS`, default 25) guards against
   hot continuation loops if an agent never reaches a terminal/handoff state — a
   safety addition beyond the spec, which assumes the agent always hands off.
+- **Attempt budget + give-up** (`agent.max_attempts` + `tracker.give_up_transition`,
+  both opt-in; unset preserves spec behavior). Caps the *total* agent runs for one
+  issue (dispatches + continuations + retries); when the budget is spent without a
+  handoff, the orchestrator annotates the task, parks it in the give-up state (a
+  non-active state, so it's no longer a dispatch candidate), and releases it. This
+  extends the continuation cap into a hard, per-issue cost ceiling for the case the
+  spec leaves open — an agent that never hands off. Requires `give_up_transition`
+  (there must be somewhere to park an abandoned issue).
 - `stall_timeout_ms` / `turn_timeout_ms` live under `agent` (driver-agnostic);
   the spec nests them under `codex`. Both spellings are accepted.
 
