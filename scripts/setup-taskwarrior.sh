@@ -2,7 +2,7 @@
 # Configure the Taskwarrior UDAs Symphony relies on.
 #
 #   state  — the workflow-state axis (todo/active/review/done/canceled)
-#   agent  — which agent driver runs the task (claude/codex/mock)
+#   agent  — which agent driver runs the task (claude/codex/copilot/mock)
 #   branch — optional explicit git branch (otherwise synthesized)
 #
 # Respects TASKRC / TASKDATA, so you can target an isolated store:
@@ -29,7 +29,7 @@ $TASK config uda.state.values "triage,todo,active,review,done,canceled"   >/dev/
 
 $TASK config uda.agent.type   string                              >/dev/null
 $TASK config uda.agent.label  "Agent"                             >/dev/null
-$TASK config uda.agent.values "claude,codex,mock"                 >/dev/null
+$TASK config uda.agent.values "claude,codex,copilot,mock"         >/dev/null
 
 $TASK config uda.branch.type  string                              >/dev/null
 $TASK config uda.branch.label "Branch"                            >/dev/null

@@ -20,6 +20,7 @@ import type { Tracker } from "./tracker.js";
 import { AgentRegistry } from "./agent.js";
 import { ClaudeDriver } from "./drivers/claude.js";
 import { CodexDriver } from "./drivers/codex.js";
+import { CopilotDriver } from "./drivers/copilot.js";
 import { MockDriver } from "./drivers/mock.js";
 import { Orchestrator } from "./orchestrator.js";
 import { startHttpServer } from "./http.js";
@@ -60,6 +61,7 @@ function buildRegistry(): AgentRegistry {
   const registry = new AgentRegistry();
   registry.register(new ClaudeDriver());
   registry.register(new CodexDriver());
+  registry.register(new CopilotDriver());
   registry.register(new MockDriver());
   return registry;
 }

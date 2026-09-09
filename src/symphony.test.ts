@@ -129,7 +129,33 @@ test("parseWorkflow applies typed defaults and resolves $VAR", () => {
   assert.equal(wf.config.polling.intervalMs, 30_000); // default
   assert.equal(wf.config.agent.maxConcurrentAgents, 10); // default
   assert.equal(wf.config.agent.defaultDriver, "mock");
+  assert.equal(wf.config.copilot.command, "copilot"); // default
+  assert.equal(wf.config.copilot.allowAllTools, true); // default (required for headless)
+  assert.equal(wf.config.copilot.model, null); // default => Copilot's own config
   assert.match(wf.promptTemplate, /Prompt for/);
+});
+
+test("parseWorkflow parses a copilot: block", () => {
+  const text = [
+    "---",
+    "tracker:",
+    "  kind: taskwarrior",
+    "  active_states: [todo]",
+    "copilot:",
+    "  command: sandbox copilot",
+    "  model: gpt-5.6-sol",
+    "  effort: high",
+    "  allow_all_tools: false",
+    "  extra_args: [--add-dir, /work]",
+    "---",
+    "body",
+  ].join("\n");
+  const wf = parseWorkflow(text, "/tmp/WORKFLOW.md");
+  assert.equal(wf.config.copilot.command, "sandbox copilot");
+  assert.equal(wf.config.copilot.model, "gpt-5.6-sol");
+  assert.equal(wf.config.copilot.effort, "high");
+  assert.equal(wf.config.copilot.allowAllTools, false);
+  assert.deepEqual(wf.config.copilot.extraArgs, ["--add-dir", "/work"]);
 });
 
 test("parseWorkflow rejects unsupported tracker kinds", () => {

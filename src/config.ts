@@ -130,6 +130,17 @@ export interface CodexConfig {
   promptArg: boolean;
 }
 
+export interface CopilotConfig {
+  /** The copilot binary (the driver appends `-p <prompt> --output-format json …`). */
+  command: string;
+  model: string | null;
+  /** Reasoning effort: none|minimal|low|medium|high|xhigh|max. null => Copilot default. */
+  effort: string | null;
+  /** Pass --allow-all — all permissions: tools + paths + urls (required for non-interactive runs). */
+  allowAllTools: boolean;
+  extraArgs: string[];
+}
+
 export interface HttpConfig {
   enabled: boolean;
   host: string;
@@ -144,6 +155,7 @@ export interface Config {
   agent: AgentConfig;
   claude: ClaudeConfig;
   codex: CodexConfig;
+  copilot: CopilotConfig;
   http: HttpConfig;
 }
 
@@ -378,6 +390,15 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     promptArg: bool(codexRaw, "prompt_arg", false, "codex"),
   };
 
+  const copilotRaw = asRecord(raw["copilot"], "copilot");
+  const copilot: CopilotConfig = {
+    command: str(copilotRaw, "command", "copilot", "copilot"),
+    model: optStr(copilotRaw, "model", "copilot"),
+    effort: optStr(copilotRaw, "effort", "copilot"),
+    allowAllTools: bool(copilotRaw, "allow_all_tools", true, "copilot"),
+    extraArgs: strArray(copilotRaw, "extra_args", [], "copilot"),
+  };
+
   const httpRaw = asRecord(raw["http"], "http");
   const http: HttpConfig = {
     enabled: bool(httpRaw, "enabled", false, "http"),
@@ -385,7 +406,7 @@ function buildConfig(raw: Record<string, unknown>, sourceDir: string): Config {
     port: num(httpRaw, "port", 4517, "http"),
   };
 
-  return { tracker, polling, workspace, hooks, agent, claude, codex, http };
+  return { tracker, polling, workspace, hooks, agent, claude, codex, copilot, http };
 }
 
 /** Parse WORKFLOW.md text into a typed Workflow. */
